@@ -1,0 +1,10 @@
+pypdf
+langchain
+langchain-community
+langchain-core
+langchain-postgres
+langchain-ollama
+supabase
+psycopg2-binary
+pgvector
+python-dotenv
