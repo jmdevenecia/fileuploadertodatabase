@@ -348,29 +348,28 @@ def delete_pdfs(
     all_files: bool,
     dry_run: bool,
     sb,
-    conn,
 ):
     """
     Delete PDFs from both pdf_ingestion_log and langchain_pg_embedding.
+    Uses only the Supabase REST API — no direct DB connection needed.
     Accepts a list of filenames, a --category filter, or --all.
     """
-    import psycopg2
 
     # ── 1. Resolve which log rows to delete ──
     try:
         if all_files:
             rows = sb.table("pdf_ingestion_log") \
-                     .select("filename, checksum, chunk_count") \
+                     .select("filename, chunk_count") \
                      .execute().data
         elif category:
             rows = sb.table("pdf_ingestion_log") \
-                     .select("filename, checksum, chunk_count") \
+                     .select("filename, chunk_count") \
                      .eq("category", category).execute().data
         else:
             rows = []
             for fname in filenames:
                 r = sb.table("pdf_ingestion_log") \
-                      .select("filename, checksum, chunk_count") \
+                      .select("filename, chunk_count") \
                       .eq("filename", fname).execute().data
                 if r:
                     rows.extend(r)
@@ -384,45 +383,53 @@ def delete_pdfs(
         print("  ℹ️  Nothing matched — no files deleted.")
         return
 
-    # ── 2. Confirm ──
-    print(f"\n  The following {len(rows)} file(s) will be deleted:")
+    # ── 2. Preview & confirm ──
+    total_chunks = sum(r.get("chunk_count") or 0 for r in rows)
+    print(f"\n  The following {len(rows)} file(s) will be permanently deleted:")
     for r in rows:
         print(f"    • {r['filename']}  ({r.get('chunk_count') or '?'} chunks)")
+    print(f"\n  Total vectors to remove: ~{total_chunks}")
 
     if dry_run:
         print("\n  🔍 DRY RUN — nothing deleted.")
         return
 
-    confirm = input(f"\n  ⚠️  Delete {len(rows)} file(s) and all their vectors? [y/N] ").strip().lower()
+    confirm = input(f"\n  ⚠️  Confirm delete? [y/N] ").strip().lower()
     if confirm != "y":
         print("  Cancelled.")
         return
 
-    # ── 3. Delete vectors from langchain_pg_embedding ──
+    # ── 3. Delete vectors via Supabase REST (langchain_pg_embedding) ──
+    #    The `source` field in cmetadata matches the PDF filename.
     deleted_vectors = 0
-    try:
-        cur = conn.cursor()
-        for r in rows:
-            fname = r["filename"]
-            cur.execute(
-                "DELETE FROM langchain_pg_embedding WHERE cmetadata->>'source' = %s",
-                (fname,)
-            )
-            deleted_vectors += cur.rowcount
-            print(f"  🗑️  Vectors deleted for '{fname}': {cur.rowcount}")
-        conn.commit()
-        cur.close()
-    except Exception as e:
-        conn.rollback()
-        print(f"  ❌ Vector deletion failed: {e}")
-        print(f"     Log entries were NOT deleted to keep things consistent.")
-        return
+    vector_errors = []
+    for r in rows:
+        fname = r["filename"]
+        try:
+            # langchain_pg_embedding stores metadata as JSONB in `cmetadata`
+            result = sb.table("langchain_pg_embedding") \
+                       .delete() \
+                       .eq("cmetadata->>source", fname) \
+                       .execute()
+            count = len(result.data) if result.data else 0
+            deleted_vectors += count
+            print(f"  🗑️  Vectors removed for '{fname}': {count}")
+        except Exception as e:
+            vector_errors.append(fname)
+            print(f"  ⚠️  Could not delete vectors for '{fname}': {e}")
+
+    if vector_errors:
+        print(f"\n  ⚠️  Vector deletion failed for {len(vector_errors)} file(s): {vector_errors}")
+        print(f"     Log entries will still be removed.")
 
     # ── 4. Delete log entries ──
     deleted_log = 0
     try:
         if all_files:
-            sb.table("pdf_ingestion_log").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+            sb.table("pdf_ingestion_log") \
+              .delete() \
+              .neq("id", "00000000-0000-0000-0000-000000000000") \
+              .execute()
             deleted_log = len(rows)
         elif category:
             sb.table("pdf_ingestion_log").delete().eq("category", category).execute()
@@ -432,10 +439,10 @@ def delete_pdfs(
                 sb.table("pdf_ingestion_log").delete().eq("filename", r["filename"]).execute()
                 deleted_log += 1
     except Exception as e:
-        print(f"  ⚠️  Log deletion failed (vectors already removed): {e}")
+        print(f"  ❌ Log deletion failed: {e}")
         return
 
-    print(f"\n  ✅ Deleted {deleted_log} log entry/entries and {deleted_vectors} vector chunk(s).")
+    print(f"\n  ✅ Deleted {deleted_log} log entry/entries and ~{deleted_vectors} vector chunk(s).")
 
 
 # ══════════════════════════════════════════════
@@ -554,16 +561,11 @@ OTHER
     from supabase import create_client
     from langchain_ollama import OllamaEmbeddings
     from langchain_postgres import PGVector
-    import psycopg2
 
     sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-    # Raw psycopg2 connection — needed for direct vector table deletes
-    conn = psycopg2.connect(DATABASE_URL)
-
     if args.list:
         list_uploads(sb)
-        conn.close()
         return
 
     if args.delete:
@@ -573,9 +575,7 @@ OTHER
             all_files=args.all,
             dry_run=args.dry_run,
             sb=sb,
-            conn=conn,
         )
-        conn.close()
         return
 
     store = PGVector(
@@ -687,7 +687,6 @@ OTHER
     print("\n" + "=" * 62)
     print(f"✅  Done!  uploaded={success}  skipped={skipped}  failed={failed}  chunks={total}")
     print("=" * 62)
-    conn.close()
 
 
 if __name__ == "__main__":
